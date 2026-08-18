@@ -1,0 +1,329 @@
+ENERGY TRADING QUANT PROJECT Day-Ahead vs Real-Time Power Spread
+Forecasting and Virtual Trading Backtest
+
+OVERALL PROJECT SCOPE
+
+The goal of this project is to design, implement, and rigorously
+evaluate a systematic trading strategy that forecasts Day-Ahead (DA) vs
+Real-Time (RT) electricity price spreads and simulates virtual trading
+profitability under realistic market constraints.
+
+This project should demonstrate: - Deep understanding of power market
+structure - Strong data engineering capability - Time-series modeling
+discipline (no look-ahead bias) - Risk-aware backtesting - Clean,
+production-quality Python code - Clear communication of assumptions,
+limitations, and results
+
+The final repository should resemble a research-grade trading framework
+rather than a notebook experiment.
+
+# ─────────────────────────────── PHASE 1:
+MARKET & STRATEGY DESIGN
+# ───────────────────────────────
+
+[x] Clearly define target ISO market -> ERCOT (island grid, wind-heavy,
+    freely available data)
+[x] Define trading instrument -> virtual bids/offers on DA vs RT spread
+    at trading hubs
+[x] Specify node vs hub strategy decision -> hub-level (HB_NORTH,
+    HB_SOUTH, HB_WEST, HB_HOUSTON); nodal extension deferred to Phase 9
+[x] Define trading frequency -> one decision per hub per hour, submitted
+    before DAM close (~10 AM CPT day-ahead)
+[x] Define holding period assumptions -> exactly one hour; positions
+    always held to settlement (no intra-day exit)
+[x] Document market mechanics:
+    - How DA and RT markets clear (SCUC/DAM + SCED real-time)
+    - Virtual bidding rules and settlement formula
+    - 15-min RTM prices averaged to hourly for P&L
+[x] Define economic hypothesis:
+    - Load forecast errors drive RT divergence from DA
+    - Renewable (wind) forecast errors are primary driver at HB_WEST
+    - Generator outages post-DAM close push RT above DA
+    - Calendar and congestion patterns create persistent biases
+[x] Define performance benchmark -> naive zero-trade strategy as primary;
+    always-short-DA and seasonal-mean strategy as secondary benchmarks
+    (documented in docs/market_design.md)
+
+# ─────────────────────────────── PHASE 2:
+DATA COLLECTION & ENGINEERING
+# ───────────────────────────────
+
+[x] Download historical Day-Ahead LMP data -> 2020-2024 via gridstatus
+    get_dam_spp(year), cached as data/raw/dam_prices_{year}.parquet
+[x] Download historical Real-Time LMP data -> 2020-2024 via gridstatus
+    get_rtm_spp(year), resampled to hourly, cached per year
+[x] Download actual load -> 2020-2024 via get_hourly_load_post_settlements,
+    system-wide ERCOT MW, cached as data/raw/load_actual_{year}.parquet
+[x] Download load forecasts -> EIA day-ahead demand forecast (type=DF)
+    for ERCO region, 2020-2024, cached as data/raw/eia_load_forecast_{year}.parquet
+[x] Collect fuel price data -> Henry Hub daily spot price (RNGWHHD series)
+    via EIA natural-gas/pri/fut endpoint, cached as data/raw/eia_gas_price_{year}.parquet
+[x] Collect renewable generation actuals -> EIA RTO fuel-type data:
+    wind (WND) and solar (SUN) for ERCO, 2020-2024, per-year parquet cache
+    NOTE: gridstatus wind/solar historical data not available via date-range
+    methods; EIA API used instead
+[x] Collect weather data -> Open-Meteo ERA5 archive (no API key), hourly temperature
+    at Austin TX (central ERCOT) 2020-2024; WeatherClient in data/weather.py;
+    cached as data/raw/weather_temperature_{year}.parquet; 3 new features added:
+    temperature_c, temperature_c_lag24h (causal), cooling_degree_hours
+[~] Investigate generator outage data availability
+    FINDING: NP3-233-CD (Hourly Resource Outage Capacity) exists back to 2013,
+    but ERCOT's unauthenticated MIS API only retains the last 31 days.
+    The ERCOT Public API (free account) only covers Dec 2023+.
+    Full 2020-2024 data requires manual bulk download from data.ercot.com (~35k files).
+    IMPLEMENTED: ERCOTOutageClient in data/outages.py works for near-real-time use
+    (last 31 days); pipeline.run_outages() and add_outage_features() in engineering.py
+    follow the same graceful-skip pattern as weather/EIA. Outage features
+    (total_outage_mw, total_outage_mw_lag1d, outage_change_1d) are skipped
+    in the 2020-2024 backtest because data/raw/outage_capacity_{year}.parquet
+    files are absent. 9 new tests added (test_outages.py); suite now 190 tests.
+[x] Align all datasets on consistent UTC timestamps
+[x] Handle missing values appropriately -> validation warns on <1% gaps,
+    6 missing hours out of 43,848 in price data (0.03%)
+[x] Build reproducible data ingestion pipeline -> DataPipeline class with
+    run(), run_eia(), build_features_dataset(); idempotent, per-year caching
+[x] Store raw data separately from processed data -> data/raw/ vs
+    data/processed/
+[x] Create automated data validation checks -> 7 composable check_*
+    functions in validation.py
+
+    DATASET STATS (2020-2024 spread dataset):
+    - 175,320 rows x 5 cols (4 hubs x ~43,830 hours)
+    - DAM LMP: mean=$63/MWh, std=$416, max=$9,000 (Uri scarcity cap)
+    - RTM LMP: mean=$61/MWh, std=$450, max=$9,204
+    - Spread: mean=+$1.78/MWh, std=$185, range=[-$5,891, +$8,479]
+    - Mean spread by year: 2020=+$0.6, 2021=-$2.5 (Uri), 2022=+$2.1,
+      2023=+$7.6, 2024=+$1.3
+
+    EIA DATA STATS (2020-2024):
+    - Wind: mean=11,614 MW, max=27,667 MW
+    - Solar: mean=2,895 MW (growing significantly over period)
+    - Gas price: mean=$3.42/MMBtu, max=$23.86 (Uri Feb 2021 spike)
+    - Load forecast: mean=48,447 MW
+
+# ─────────────────────────────── PHASE 3:
+FEATURE ENGINEERING
+# ───────────────────────────────
+
+[x] Construct DA-RT spread target variable -> spread = dam_lmp - rtm_lmp,
+    stored in spread_dataset.parquet
+[x] Add calendar effects -> hour_utc, hour_cpt (UTC-6 approx), dow, month,
+    quarter, is_weekend, is_peak (HE7-22 non-weekend); sin/cos cyclical
+    encodings for hour and month
+[x] Include lagged spread features -> spread_lag_{1,2,7}d and
+    spread_lag_{1,2,4}w per hub (groupby+shift, no cross-hub contamination)
+[x] Include lagged price level features -> dam_lmp_lag_{1,7}d and
+    rtm_lmp_lag_{1,7}d per hub
+[x] Engineer ramp indicators -> load_ramp_1h (lag1h - lag2h) and
+    load_ramp_24h (lag24h - lag48h); load_mw_lag1h and load_mw_lag1d
+[x] Include rolling volatility features -> spread_vol_24h and
+    spread_vol_168h (shift(1) before rolling to exclude current obs)
+[x] Create congestion regime indicator -> west_north_spread_diff
+    (HB_WEST - HB_NORTH spread differential, lagged 1 day)
+[x] Compute renewable generation features -> wind_actual_mw,
+    wind_actual_mw_lag1d, solar_actual_mw, solar_actual_mw_lag1d
+[x] Include gas-electric spread features -> gas_price_mmbtu,
+    gas_price_lag1d, gas_elec_spread (dam_lmp - 7.0 * gas_price_lag1d)
+[x] Compute load forecast error -> load_forecast_mw (EIA DA forecast),
+    load_forecast_error = load_mw - load_forecast_mw
+[x] Standardize / normalize features appropriately (done at model fit time via StandardScaler
+    Pipeline for linear models; LightGBM is scale-invariant)
+[x] Ensure all features respect time causality (no leakage) -> all lags
+    use shift(n>=1); rolling windows use shift(1) before rolling
+
+    FEATURES DATASET STATS:
+    - 175,320 rows x 45 cols saved to data/processed/features_dataset.parquet
+      (+3 weather cols: temperature_c, temperature_c_lag24h, cooling_degree_hours)
+    - All null rates <= 1.5% (warmup-period NaNs only, excluded at training)
+    - Implemented in src/energy_trading/features/engineering.py
+
+# ─────────────────────────────── PHASE 4:
+MODEL DEVELOPMENT
+# ───────────────────────────────
+
+[x] Implement baseline linear regression model -> OLS wrapped in StandardScaler Pipeline
+[x] Implement regularized models (Ridge / Lasso) -> ridge_alpha=1.0, lasso_alpha=0.1
+[x] Implement tree-based model (e.g., gradient boosting) -> LightGBM (n_est=500,
+    lr=0.05, num_leaves=31, min_child_samples=50, subsample/colsample=0.8)
+[x] Use time-series cross-validation -> WalkForwardCV expanding-window by calendar year
+[x] Implement walk-forward validation -> run_walk_forward() per-hub, sklearn.base.clone()
+    per (fold, model) to prevent state leakage
+[x] Compare out-of-sample performance across models -> 64-row metrics_df saved to
+    data/processed/walk_forward_metrics.parquet; 139,420-row oos_df saved to
+    data/processed/oos_predictions.parquet
+[x] Evaluate feature importance -> get_feature_importance() extracts abs(coef_) for
+    linear models, gain-based feature_importances_ for LightGBM
+[x] Test model stability across seasons and years -> 4 folds (2021-2024 test years),
+    99 unit tests all passing
+[x] Document overfitting controls -> StandardScaler for linear, LightGBM conservative
+    defaults (min_child_samples=50, reg_alpha=0.1, reg_lambda=1.0)
+
+    OOS RESULTS (mean across all hubs and folds):
+    - Spread is extremely noisy (std=$185); negative R² expected for all models
+    - 2021 fold dominated by Uri winter storm (RMSE ~550, model had no prior event)
+    - 2022 fold: LightGBM overfits Uri patterns -> RMSE ~700 (linear ~197)
+    - 2023/2024 folds much better: RMSE ~70-200, direction_accuracy ~55-59%
+    - Lasso slightly best on RMSE (250.2) and directional accuracy (52.2%)
+    - Direction accuracy marginally above 50% = potential trading edge if filtered
+    - Models: src/energy_trading/models/{metrics,train,walk_forward}.py
+    - Tests: tests/test_models.py (~48 tests)
+
+# ─────────────────────────────── PHASE 5:
+TRADING STRATEGY & BACKTEST ENGINE
+# ───────────────────────────────
+
+[x] Define trading signal threshold logic -> generate_signals() with threshold
+    parameter; +1 long spread, -1 short, 0 flat when |pred| < threshold
+[x] Incorporate confidence-based trade filtering -> threshold sweep [0,5,15,30]
+    via run_all_backtests(); also scale_by_confidence flag for position sizing
+[x] Implement position sizing rules -> lot_mwh base size, optional
+    confidence scaling (|pred|/mean(|pred|)), all in compute_hourly_pnl()
+[x] Model transaction costs and bid spreads -> transaction_cost_per_mwh param
+    (default 0.0; user can set to realistic $0.25-1.00/MWh)
+[x] Include bid caps and position limits -> max_mwh=100.0 (ERCOT-style cap)
+[x] Simulate realistic P&L calculations -> gross_pnl = signal × position_mwh ×
+    actual_spread; net_pnl = gross_pnl - transaction_cost_paid
+[x] Track cumulative returns -> cumulative_pnl = net_pnl.cumsum() column in
+    trade_df; per-hour granularity for equity curve plotting
+[x] Compute performance metrics:
+    - Annualized return -> total_pnl × 8760 / n_obs
+    - Sharpe ratio -> mean(pnl) × sqrt(8760) / std(pnl, ddof=1)
+    - Sortino ratio -> mean(pnl) × sqrt(8760) / sqrt(mean(min(pnl,0)^2))
+    - Max drawdown -> max(cumsum.cummax() - cumsum)
+    - Win rate -> fraction of trading hours with net_pnl > 0
+    - Tail risk (CVaR) -> mean(pnl[pnl <= quantile(pnl, 0.05)])
+[x] Stress test during high volatility periods (esp. Uri Feb 2021)
+    -> Uri regime isolated in compute_regime_metrics(); Sharpe=14.92 (264 hrs)
+[x] Analyze performance by regime (high load, high renewables, etc.)
+    -> compute_regime_metrics() in risk.py; 11 regimes documented in Phase 6
+
+    BACKTEST RESULTS (lot_mwh=1.0, tc=0, threshold=0, per hub):
+    - LightGBM: best overall Sharpe 1.85 at HB_SOUTH, total_pnl=+$138k
+      (4.5 years, 1 MWh; direction_accuracy ~53% beats linear ~51%)
+    - Linear/Ridge: negative Sharpe (-0.09) frequent wrong-direction shorts
+    - Lasso: marginally best linear (Sharpe -0.025, total_pnl=+$17k)
+    - Max drawdown: $53-100k per 1 MWh position (inherent to spread volatility)
+    - Files: src/energy_trading/backtest/{metrics,engine}.py
+    - Tests: tests/test_backtest.py (40 tests, all passing; 139 total suite)
+    - Saved: data/processed/backtest_summary.parquet (64 rows: 4m×4h×4t)
+
+# ─────────────────────────────── PHASE 6:
+RISK ANALYSIS
+# ───────────────────────────────
+
+[x] Analyze drawdown periods -> identify_drawdown_periods() in risk.py;
+    209 drawdown periods found for lgbm/HB_SOUTH, ALL recovered;
+    worst depth=$53,337 (matches max_drawdown metric exactly)
+[x] Decompose losses by feature regime -> compute_regime_metrics() joins
+    trade_df with features_df on DatetimeIndex; regimes: peak, off_peak,
+    uri_storm, non_uri, high/low_vol, high/low_wind, high/low_gas
+[x] Test sensitivity to transaction cost assumptions -> tc_sensitivity()
+    sweeps TC=[0,0.25,0.50,0.75,1.00,1.50,2.00]; strategy remains
+    profitable through $2/MWh (Sharpe 0.92 at $2); saved risk_tc_sensitivity.parquet
+[x] Analyze exposure to gas prices -> via compute_regime_metrics() gas
+    quartiles; high_gas: Sharpe=1.90, low_gas: Sharpe=2.05 (similar)
+[x] Analyze correlation with volatility regimes -> via compute_regime_metrics();
+    high_vol: Sharpe=2.26, low_vol: Sharpe=5.59 (strategy MORE profitable
+    in calm markets due to directional consistency)
+[x] Evaluate tail risk exposure -> compute_tail_risk(); skewness=-1.50
+    (left tail), excess_kurtosis=440 (extreme fat tails from Uri),
+    max_consecutive_loss_hours=62, VaR_1pct=$-155, CVaR_1pct=$-781;
+    saved as printed dict (not parquet)
+[x] Test robustness under parameter perturbations -> parameter_robustness()
+    sweeps threshold=[0,2,5,10,15,20,30,50]; threshold=2 slightly best
+    (Sharpe 1.87 vs 1.85 at t=0); positive P&L at all thresholds;
+    saved risk_parameter_robustness.parquet
+
+    RISK ANALYSIS RESULTS (lgbm / HB_SOUTH, lot=1 MWh, tc=0, post-Phase-9a weather):
+    KEY FINDINGS:
+    - Peak hours: Sharpe=3.18 vs off-peak Sharpe=0.73 (peak trading much better)
+    - Uri storm: Sharpe=14.92 (264 hrs) model benefits from extreme spread signal
+    - Low wind: Sharpe=2.88 vs high_wind Sharpe=0.63 strategy degrades in high-wind hrs
+    - Low vol: Sharpe=5.33 vs high_vol Sharpe=2.60 calmer markets more predictable
+    - TC breakeven: profitable through $3/MWh round-trip (improved from $2)
+    - Tail risk: fat tails (kurtosis=440), max 62 consecutive loss hours
+    - All 237 drawdown periods fully recovered over 4.5 year OOS window
+    - Files: src/energy_trading/backtest/risk.py
+    - Tests: tests/test_risk.py (32 tests, all passing; 181 total suite)
+    - Saved: risk_drawdowns.parquet, risk_regime_metrics.parquet,
+      risk_tc_sensitivity.parquet, risk_parameter_robustness.parquet
+
+# ─────────────────────────────── PHASE 7:
+CODE QUALITY & REPOSITORY STRUCTURE
+# ───────────────────────────────
+
+[x] Structure repository with clean modular layout:
+    - src/energy_trading/{data,features,models,backtest,utils}
+    - tests/ (171 passing unit tests)
+    - docs/ (market_design.md)
+    - data/{raw,processed}
+    - notebooks/
+[x] Write reusable, modular functions -> ERCOTClient, EIAClient,
+    DataPipeline, validation check_* functions, feature engineering
+    functions, walk-forward CV, backtest engine; all independently testable
+[x] Add unit tests for critical functions -> 190 tests across
+    test_validation.py, test_features.py, test_eia.py, test_models.py,
+    test_backtest.py, test_risk.py, test_weather.py, test_outages.py; all passing
+[x] Use configuration files for parameters -> Pydantic Settings in
+    config.py, all params via ET_ env vars or .env file
+[x] Remove hard-coded paths -> all paths derived from Settings.data_dir
+[x] Add logging -> Loguru configured in utils/logging.py, structured
+    format with module/function/line context
+[x] Add clear docstrings -> Google-style docstrings throughout, all
+    public methods documented with Args/Returns/Raises
+[x] Ensure reproducibility from scratch -> uv.lock pins all deps,
+    pyproject.toml declares all requirements, pipeline is idempotent
+[x] Create requirements.txt or environment file -> pyproject.toml +
+    uv.lock (uv-managed venv)
+
+# ─────────────────────────────── PHASE 8:
+DOCUMENTATION (CRITICAL FOR HIRING)
+# ───────────────────────────────
+
+[x] Write professional README including:
+    - Market overview (ERCOT island grid, virtual bids, economic hypothesis)
+    - Economic intuition (load/wind forecast error → spread predictability)
+    - Data description (175k rows, 42 features, 5-year coverage table)
+    - Modeling methodology (4 models, walk-forward CV expanding window)
+    - Backtesting framework (signal generation, P&L formula, TC model)
+    - Results (summary table all 4 hubs × models, best: lgbm/HB_SOUTH Sharpe=1.85)
+    - Risk analysis (regime decomposition, TC sensitivity, tail risk table)
+    - Limitations (negative R², signal decay, perfect fill, hub-only)
+    - Quick Start (install, download data, run walk-forward, regenerate plots)
+    → README.md (full professional document, ~500 lines)
+[x] Include performance plots -> docs/plots/walk_forward_performance.png
+    (direction accuracy + RMSE by fold/model for HB_SOUTH)
+[x] Include feature importance plots -> docs/plots/feature_importance.png
+    (top-15 LightGBM gain importances; lagged spreads dominate)
+[x] Include equity curve visualization -> docs/plots/equity_curve.png
+    (all 4 models + drawdown shading + Uri annotation, 2021-2024 OOS)
+[x] Include discussion of model weaknesses -> README Section 7:
+    negative R², signal decay 58%->53% DA 2021->2024, Uri OOD event,
+    LightGBM Uri overfitting, no probabilistic output, flat lot sizing
+[x] Write limitations honestly and rigorously -> README Section 7:
+    7 forecasting + backtest limitations explicitly called out
+    Additional plots: regime_decomposition.png, tc_sensitivity.png
+    Script: scripts/generate_plots.py (regenerates all 5 PNGs)
+
+# ─────────────────────────────── PHASE 9:
+ADVANCED EXTENSIONS (OPTIONAL BUT IMPRESSIVE)
+# ───────────────────────────────
+
+[ ] Add probabilistic forecasting instead of point prediction
+[ ] Add regime-switching models
+[ ] Incorporate nodal congestion modeling
+[ ] Add battery arbitrage simulation
+[ ] Explore reinforcement learning approach
+[ ] Incorporate transmission constraint indicators
+[ ] Perform out-of-market validation (another ISO)
+
+# ─────────────────────────────── FINAL GOAL
+# ───────────────────────────────
+
+Produce a research-grade repository that demonstrates: - Market
+understanding - Statistical rigor - Risk awareness - Production-quality
+code - Honest evaluation of results
+
+This project should be strong enough that you could walk into an energy
+trading desk interview and defend every modeling decision, assumption,
+and result in detail.
