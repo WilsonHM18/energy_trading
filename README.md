@@ -9,16 +9,16 @@ Forecasting the Day-Ahead vs Real-Time LMP spread at ERCOT hub nodes and simulat
 
 ## Table of Contents
 
-1. [Overview]
-2. [Market Design]
+1. [Overview](#1-overview)
+2. [Market Design](#2-market-design)
 3. [Data](#3-data)
-4. [Methodology]
-5. [Results]
-6. [Risk Analysis]
-7. [Limitations]
-8. [Repository Structure]
-9. [Quick Start]
-10. [References]
+4. [Methodology](#4-methodology)
+5. [Results](#5-results)
+6. [Risk Analysis](#6-risk-analysis)
+7. [Limitations](#7-limitations)
+8. [Repository Structure](#8-repository-structure)
+9. [Quick Start](#9-quick-start)
+10. [References](#10-references)
 
 
 ## 1. Overview
